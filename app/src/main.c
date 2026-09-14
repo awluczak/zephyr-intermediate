@@ -1,12 +1,13 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/zbus/zbus.h>
 #include <zephyr/random/random.h>
+#include <zephyr/task_wdt/task_wdt.h>
 
 LOG_MODULE_REGISTER(zbus_test, LOG_LEVEL_DBG);
 
 #define STACK_SIZE                (2048)
 #define SENSOR_SAMPLE_INTERVAL_MS (100)
+#define QUEUE_DEPTH               (10)
 
 struct sensor_data 
 {
@@ -14,39 +15,7 @@ struct sensor_data
     uint32_t timestamp;
 };
 
-static void sensor_lis_cb(const struct zbus_channel *chan);
-
-/* ================================================================== */
-/*  Observers                                                         */
-/* ================================================================== */
-
-ZBUS_LISTENER_DEFINE(sensor_lis, sensor_lis_cb);
-
-ZBUS_MSG_SUBSCRIBER_DEFINE(sensor_sub);
-
-/* ================================================================== */
-/*  Channel                                                           */
-/* ================================================================== */
-
-ZBUS_CHAN_DEFINE(sensor_chan, struct sensor_data,
-                 NULL, NULL,
-                 ZBUS_OBSERVERS(sensor_lis, sensor_sub),
-                 ZBUS_MSG_INIT(
-                    .value = 0,
-                    .timestamp = 0));
-
-/* ================================================================== */
-/*  Listener - synchronous observer                                   */
-/* ================================================================== */
-
-static void sensor_lis_cb(const struct zbus_channel *chan)
-{
-    const struct sensor_data *msg =
-        (const struct sensor_data *)zbus_chan_const_msg(chan);
-
-    LOG_INF("Sensor Listener: value = %u, timestamp = %u",
-            msg->value, msg->timestamp);
-}
+K_MSGQ_DEFINE(sensor_queue, sizeof(struct sensor_data), QUEUE_DEPTH, 4);
 
 /* ================================================================== */
 /*  Publisher                                                         */
@@ -69,7 +38,7 @@ static void sensor_thread_fn(void *p1, void *p2, void *p3)
         LOG_INF("Sensor Publisher: value = %u, timestamp = %u",
             data.value, data.timestamp);
 
-        int ret = zbus_chan_pub(&sensor_chan, &data, K_MSEC(100));
+        int ret = k_msgq_put(&sensor_queue, &data, K_NO_WAIT);
         if (ret != 0) 
         {
             LOG_WRN("Sensor Publisher: publish failed (%d)", ret);
@@ -83,49 +52,74 @@ static void sensor_thread_fn(void *p1, void *p2, void *p3)
 /*  Message subscriber - logger                                       */
 /* ================================================================== */
 
+
+void task_wdt_callback(int channel_id, void *user_data)
+{
+    LOG_ERR("Task Watchdog: Fired!");
+}
+
 static void logger_thread_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    const struct zbus_channel *chan;
-    struct sensor_data temp_msg = {0};
-    struct sensor_data last_msg = {0};
-    int messages_dropped = 0;
+    struct sensor_data msg = {0};
     int ret = 0;
+    int wdt = task_wdt_add(1000, task_wdt_callback, (void *)k_current_get());
 
     while (1) 
-    {
-        temp_msg = (struct sensor_data){0};
-        last_msg = (struct sensor_data){0};
-        messages_dropped = 0;
+    {   
+        msg = (struct sensor_data){0};
 
-        do
+        do 
         {
-            ret = zbus_sub_wait_msg(&sensor_sub, &chan, &temp_msg, K_NO_WAIT);
-            if (!ret)
+            ret = k_msgq_get(&sensor_queue, &msg, K_NO_WAIT);
+            if (ret != 0)
             {
-                if (last_msg.timestamp)
+                if (ret != -ENOMSG)
                 {
-                    messages_dropped++;
+                    LOG_WRN("Sensor Logger: Failed to get message (%d)", ret);
                 }
-
-                last_msg = temp_msg;    
+                   
+                break;    
             }
-          
+
+            LOG_INF("Sensor Logger: Value = %u, Timestamp = %u",
+                    msg.value, msg.timestamp);
+
         } while (!ret);
-        
-        if (ret == -ETIMEDOUT) 
+
+        task_wdt_feed(wdt);
+
+        int sleep_ms = 100 * (1 + sys_rand32_get() % 10);
+        LOG_INF("Sensor Logger: Sleep for %d ms", sleep_ms);
+        k_msleep(sleep_ms);
+    }
+}
+
+/* ================================================================== */
+/*  Health checker                                                    */
+/* ================================================================== */
+
+static void health_checker_thread_fn(void *p1, void *p2, void *p3)
+{
+    bool reported = false;
+
+    while (1)
+    {
+        if (k_msgq_num_used_get(&sensor_queue) >= ((QUEUE_DEPTH * 75) / 100))
         {
-            LOG_WRN("Sensor Logger: timeout (%d)", ret);
-            break;
+            if (!reported)
+            {
+                LOG_WRN("Health Checker: 75%% of sensor queue filled!");
+                reported = true;
+            }
+        }
+        else
+        {
+            reported = false;
         }
 
-        LOG_INF("Sensor Logger: value = %u, timestamp = %u (latency = %d ms, dropped = %d)",
-                last_msg.value, last_msg.timestamp, 
-                k_uptime_get_32() - last_msg.timestamp, messages_dropped);
-
-        LOG_INF("Sensor Logger: simulating longer work (500 ms)");
-        k_msleep(500);
+        k_sleep(K_MSEC(5));
     }
 }
 
@@ -139,11 +133,15 @@ K_THREAD_DEFINE(sensor_thread, STACK_SIZE, sensor_thread_fn,
 K_THREAD_DEFINE(logger_thread, STACK_SIZE, logger_thread_fn,
                 NULL, NULL, NULL, 6, 0, 0);
 
+K_THREAD_DEFINE(health_checker_thread, STACK_SIZE, health_checker_thread_fn,
+                NULL, NULL, NULL, 7, 0, 0);
+
 /* ================================================================== */
 /*  Main                                                              */
 /* ================================================================== */
 
 int main(void)
 {
+    task_wdt_init(NULL);
     return 0;
 }
