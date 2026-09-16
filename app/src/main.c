@@ -1,147 +1,115 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/random/random.h>
-#include <zephyr/task_wdt/task_wdt.h>
+#include <zephyr/tracing/tracing.h>
 
-LOG_MODULE_REGISTER(zbus_test, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(homework, LOG_LEVEL_INF);
 
-#define STACK_SIZE                (2048)
-#define SENSOR_SAMPLE_INTERVAL_MS (100)
-#define QUEUE_DEPTH               (10)
+#define STACK_SIZE            2048
+#define CONTROL_PRIORITY         7
+#define MAINTENANCE_PRIORITY     4
+#define EVENT_PERIOD_MS        250
+#define MAINTENANCE_LOAD_US  28000
+#define RESPONSE_DEADLINE_MS    30
 
-struct sensor_data 
-{
-    uint32_t value;
-    uint32_t timestamp;
+struct control_event {
+    uint32_t seq;
+    uint32_t ready_ms;
 };
 
-K_MSGQ_DEFINE(sensor_queue, sizeof(struct sensor_data), QUEUE_DEPTH, 4);
+K_MSGQ_DEFINE(control_queue, sizeof(struct control_event), 4, 4);
+K_SEM_DEFINE(maintenance_start, 0, 1);
 
 /* ================================================================== */
-/*  Publisher                                                         */
+/*  Timer expiry: creates one control event                           */
 /* ================================================================== */
 
-static void sensor_thread_fn(void *p1, void *p2, void *p3)
+static void event_timer_expiry(struct k_timer *timer)
+{
+    ARG_UNUSED(timer);
+
+    static uint32_t seq;
+    struct control_event event = {
+        .seq = seq++,
+        .ready_ms = k_uptime_get_32(),
+    };
+
+    /* Timer expiry runs in interrupt context, so never wait here. */
+    int ret = k_msgq_put(&control_queue, &event, K_NO_WAIT);
+
+    if (ret != 0) {
+        return;
+    }
+
+    /* Both threads become ready when the timer interrupt returns. */
+    k_sem_give(&maintenance_start);
+
+    /* TODO: Add an application trace event for this sequence. */
+}
+
+K_TIMER_DEFINE(event_timer, event_timer_expiry, NULL);
+
+/* ================================================================== */
+/*  Control thread                                                   */
+/* ================================================================== */
+
+static void control_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    LOG_INF("Sensor Publisher: Starting");
+    uint32_t deadline_misses = 0;
 
-    while (1) 
-    {
-        struct sensor_data data = 
-        {
-            .value = sys_rand32_get() % 100,
-            .timestamp = k_uptime_get_32()
-        };
+    while (true) {
+        struct control_event event;
+        int ret = k_msgq_get(&control_queue, &event, K_FOREVER);
 
-        LOG_INF("Sensor Publisher: value = %u, timestamp = %u",
-            data.value, data.timestamp);
-
-        int ret = k_msgq_put(&sensor_queue, &data, K_NO_WAIT);
-        if (ret != 0) 
-        {
-            LOG_WRN("Sensor Publisher: publish failed (%d)", ret);
+        if (ret != 0) {
+            LOG_ERR("[CONTROL] receive failed: %d", ret);
+            continue;
         }
 
-        k_msleep(SENSOR_SAMPLE_INTERVAL_MS);
+        LOG_INF("[CONTROL] processed seq=%u", event.seq);
+
+        uint32_t latency_ms = k_uptime_get_32() - event.ready_ms;
+        if (latency_ms > RESPONSE_DEADLINE_MS) {
+            ++deadline_misses;
+            LOG_WRN_RATELIMIT("[CONTROL] deadline missed (count=%u, seq=%u, latency_ms=%u)", 
+                deadline_misses, event.seq, latency_ms);
+            sys_trace_named_event("control_deadline", event.seq, latency_ms);
+        }
+
+        sys_trace_named_event("control_done", event.seq, latency_ms);
     }
 }
 
 /* ================================================================== */
-/*  Message subscriber - logger                                       */
+/*  Background maintenance thread                                    */
 /* ================================================================== */
 
-
-void task_wdt_callback(int channel_id, void *user_data)
-{
-    LOG_ERR("Task Watchdog: Fired!");
-}
-
-static void logger_thread_fn(void *p1, void *p2, void *p3)
+static void maintenance_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    struct sensor_data msg = {0};
-    int ret = 0;
-    int wdt = task_wdt_add(1000, task_wdt_callback, (void *)k_current_get());
+    while (true) {
+        k_sem_take(&maintenance_start, K_FOREVER);
 
-    while (1) 
-    {   
-        msg = (struct sensor_data){0};
-
-        do 
-        {
-            ret = k_msgq_get(&sensor_queue, &msg, K_NO_WAIT);
-            if (ret != 0)
-            {
-                if (ret != -ENOMSG)
-                {
-                    LOG_WRN("Sensor Logger: Failed to get message (%d)", ret);
-                }
-                   
-                break;    
-            }
-
-            LOG_INF("Sensor Logger: Value = %u, Timestamp = %u",
-                    msg.value, msg.timestamp);
-
-        } while (!ret);
-
-        task_wdt_feed(wdt);
-
-        int sleep_ms = 100 * (1 + sys_rand32_get() % 10);
-        LOG_INF("Sensor Logger: Sleep for %d ms", sleep_ms);
-        k_msleep(sleep_ms);
+        /* This work is important, but it has no short deadline. */
+        k_busy_wait(MAINTENANCE_LOAD_US);
     }
 }
 
-/* ================================================================== */
-/*  Health checker                                                    */
-/* ================================================================== */
+K_THREAD_DEFINE(control, STACK_SIZE, control_fn,
+                NULL, NULL, NULL, CONTROL_PRIORITY, 0, 0);
 
-static void health_checker_thread_fn(void *p1, void *p2, void *p3)
-{
-    bool reported = false;
-
-    while (1)
-    {
-        if (k_msgq_num_used_get(&sensor_queue) >= ((QUEUE_DEPTH * 75) / 100))
-        {
-            if (!reported)
-            {
-                LOG_WRN("Health Checker: 75%% of sensor queue filled!");
-                reported = true;
-            }
-        }
-        else
-        {
-            reported = false;
-        }
-
-        k_sleep(K_MSEC(5));
-    }
-}
-
-/* ================================================================== */
-/*  Threads                                                           */
-/* ================================================================== */
-
-K_THREAD_DEFINE(sensor_thread, STACK_SIZE, sensor_thread_fn,
-                NULL, NULL, NULL, 5, 0, 0);
-
-K_THREAD_DEFINE(logger_thread, STACK_SIZE, logger_thread_fn,
-                NULL, NULL, NULL, 6, 0, 0);
-
-K_THREAD_DEFINE(health_checker_thread, STACK_SIZE, health_checker_thread_fn,
-                NULL, NULL, NULL, 7, 0, 0);
-
-/* ================================================================== */
-/*  Main                                                              */
-/* ================================================================== */
+K_THREAD_DEFINE(maintenance, STACK_SIZE, maintenance_fn,
+                NULL, NULL, NULL, MAINTENANCE_PRIORITY, 0, 0);
 
 int main(void)
 {
-    task_wdt_init(NULL);
+    LOG_INF("=== L6 Homework: Runtime Investigation ===");
+    LOG_INF("Control work must start within 10 ms");
+    LOG_INF("Inspect, measure, trace, explain, and correct the delay");
+
+    k_timer_start(&event_timer, K_MSEC(500), K_MSEC(EVENT_PERIOD_MS));
+
     return 0;
 }
