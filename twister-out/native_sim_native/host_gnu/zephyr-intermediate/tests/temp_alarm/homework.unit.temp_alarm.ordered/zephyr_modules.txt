@@ -1,0 +1,4 @@
+"cmsis_6":"/home/adam/iomico/modules/hal/cmsis_6":"${ZEPHYR_CMSIS_6_CMAKE_DIR}"
+"hal_nordic":"/home/adam/iomico/modules/hal/nordic":"${ZEPHYR_HAL_NORDIC_CMAKE_DIR}"
+"hal_nxp":"/home/adam/iomico/modules/hal/nxp":"${ZEPHYR_HAL_NXP_CMAKE_DIR}"
+"hal_stm32":"/home/adam/iomico/modules/hal/stm32":"/home/adam/iomico/modules/hal/stm32"
